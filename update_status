@@ -1,0 +1,100 @@
+#!/usr/bin/env ruby
+
+require 'fitgem'
+require 'pp'
+require 'yaml'
+require 'httparty'
+require 'json'
+
+fitgem_file = '.fitgem.yml'
+hipchat_file = '.hipchat.yml'
+
+fitgem_config = begin
+  Fitgem::Client.symbolize_keys(YAML.load(File.open(fitgem_file)))
+rescue ArgumentError => e
+  puts "Could not parse YAML: #{e.message}"
+  exit
+end
+
+hipchat_config = begin
+  YAML.load(File.open(hipchat_file))
+rescue ArgumentError => e
+  puts "Could not parse YAML: #{e.message}"
+  exit
+end
+
+fitgem_client = Fitgem::Client.new(fitgem_config[:oauth])
+
+# With the token and secret, we will try to use them
+# to reconstitute a usable Fitgem::Fitgem_Client
+if fitgem_config[:oauth][:token] && fitgem_config[:oauth][:secret]
+  begin
+    access_token = fitgem_client.reconnect(fitgem_config[:oauth][:token], fitgem_config[:oauth][:secret])
+  rescue Exception => e
+    puts "Error: Could not reconnect Fitgem::Fitgem_Client due to invalid keys in #{fitgem_file}"
+    exit
+  end
+# Without the secret and token, initialize the Fitgem::Fitgem_Client
+# and send the user to login and get a verifier token
+else
+  request_token = fitgem_client.request_token
+  token = request_token.token
+  secret = request_token.secret
+
+  puts "Go to http://www.fitbit.com/oauth/authorize?oauth_token=#{token} and then enter the verifier code below"
+  verifier = gets.chomp
+
+  begin
+    access_token = fitgem_client.authorize(token, secret, { :oauth_verifier => verifier })
+  rescue Exception => e
+    puts 'Error: Could not authorize Fitgem::Fitgem_Client with supplied oauth verifier'
+    exit
+  end
+
+  user_id = fitgem_client.user_info['user']['encodedId']
+  puts "Verifier is:     #{verifier}"
+  puts "Token is:        #{access_token.token}"
+  puts "Secret is:       #{access_token.secret}"
+  puts "Current User is: #{user_id}"
+
+  fitgem_config[:oauth].merge!(:token => access_token.token, :secret => access_token.secret, :user_id => user_id)
+
+  # Write the whole oauth token set back to the fitgem file
+  File.open(fitgem_file, 'w') { |f| f.write(fitgem_config.to_yaml) }
+end
+
+loop do
+  today_steps = fitgem_client.activities_on_date('today')['summary']['steps']
+  status = "#{today_steps} Fitbit Steps"
+  auth_token = hipchat_config[:oauth][:token]
+  email = hipchat_config[:email]
+  hipchat_user = HTTParty.get("https://api.hipchat.com/v2/user/#{email}?auth_token=#{auth_token}")
+
+  update_attrs = {
+    :name => hipchat_user['name'],
+    :title => hipchat_user['title'],
+    :presence => {
+      :status => status,
+      :show => nil,
+    },
+    :mention_name => hipchat_user['mention_name'],
+    :timezone => hipchat_user['timezone'],
+    :email => hipchat_user['email']
+  }
+
+  options = {
+    :query => {
+      :auth_token => auth_token
+    },
+    :body => update_attrs.to_json,
+    :headers => {
+      'accept' => 'application/json',
+    'content-type' => 'application/json'
+    }
+  }
+
+  HTTParty.put("https://api.hipchat.com/v2/user/#{email}", options)
+  puts "Updated Hipchat Status for #{email} to #{status}"
+
+  sleep 600
+end
